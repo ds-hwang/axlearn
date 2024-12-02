@@ -5,12 +5,14 @@
 import contextlib
 import dataclasses
 import enum
+import math
 import sys
 from collections import OrderedDict
 from collections.abc import Iterable, Sequence
 from typing import Any, NamedTuple, Optional, Union
 
 # pylint: disable=no-self-use
+import chex
 import jax
 import jaxlib
 import numpy as np
@@ -20,7 +22,7 @@ import torch
 from absl.testing import absltest, parameterized
 from jax import numpy as jnp
 from jax.experimental import checkify, mesh_utils
-from jax.sharding import PartitionSpec
+from jax.sharding import NamedSharding, PartitionSpec
 
 from axlearn.common import learner, optimizers, serialization, struct, utils
 from axlearn.common.base_layer import BaseLayer, FactorizationSpec, ParameterSpec
@@ -70,6 +72,7 @@ from axlearn.common.utils import (
     match_regex_rules,
     prune_tree,
     pytree_children,
+    replicate_sharding,
     replicate_to_local_data,
     runtime_checks,
     set_data_dir,
@@ -1696,6 +1699,52 @@ class HybridMeshShapeTest(TestCase):
             )
 
         self.assertEqual(2, len(HybridMeshShape(ici_mesh_shape=(1, 2), dcn_mesh_shape=(3, 4))))
+
+
+class CpuShardingTest(TestCase):
+    """Tests sharding utils using fake cpu devices."""
+
+    def setUp(self):
+        chex.set_n_cpu_devices(8)
+        super().setUp()
+
+    def _create_mesh(self):
+        mesh_shape = [2, 2, 2]
+        self.assertEqual(math.prod(mesh_shape), jax.device_count())
+        mesh_axis_names = ["data", "fsdp", "model"]
+        device_mesh = mesh_utils.create_device_mesh(mesh_shape=mesh_shape)
+        mesh = jax.sharding.Mesh(devices=device_mesh, axis_names=mesh_axis_names)
+        return mesh
+
+    def test_with_sharding_constraint(self):
+        inputs = jnp.ones((4, 10))
+        jax.debug.visualize_array_sharding(inputs)
+
+        mesh = self._create_mesh()
+        data_pspec = PartitionSpec("data")
+        data_sharding = NamedSharding(mesh, data_pspec)
+        ref_shard_inputs = jax.tree.map(lambda x: jax.device_put(x, data_sharding), inputs)
+        jax.debug.visualize_array_sharding(ref_shard_inputs)
+
+        with mesh:
+            test_shard_inputs = with_sharding_constraint(inputs, data_sharding)
+        jax.debug.visualize_array_sharding(test_shard_inputs)
+        self.assertEqual(ref_shard_inputs.sharding, test_shard_inputs.sharding)
+
+    def test_replicate_sharding(self):
+        inputs = jnp.ones((4, 10))
+        jax.debug.visualize_array_sharding(inputs)
+
+        mesh = self._create_mesh()
+        data_pspec = PartitionSpec("data")
+        data_sharding = NamedSharding(mesh, data_pspec)
+        ref_shard_inputs = jax.tree.map(lambda x: jax.device_put(x, data_sharding), inputs)
+        jax.debug.visualize_array_sharding(ref_shard_inputs)
+
+        with mesh:
+            test_shard_inputs = replicate_sharding(source=ref_shard_inputs, target=inputs)
+        jax.debug.visualize_array_sharding(test_shard_inputs)
+        self.assertEqual(ref_shard_inputs.sharding, test_shard_inputs.sharding)
 
 
 class HostToGlobalArrayTest(TestCase):
