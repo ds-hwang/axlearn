@@ -234,10 +234,10 @@ class TestCase(parameterized.TestCase):
             else:
                 self.assertAlmostEqual(a_value, b_value, msg=f"{a_name}")
 
-    def assertNestedEqual(self, a, b):
+    def assertNestedEqual(self, a, b, msg=None):
         a_kv = flatten_items(a)
         b_kv = flatten_items(b)
-        self.assertCountEqual([k for k, _ in a_kv], [k for k, _ in b_kv])
+        self.assertCountEqual([k for k, _ in a_kv], [k for k, _ in b_kv], msg=msg)
         a_dict = dict(a_kv)
         b_dict = dict(b_kv)
         for k in a_dict:
@@ -245,7 +245,7 @@ class TestCase(parameterized.TestCase):
             b_value = b_dict[k]
             np.testing.assert_array_equal(a_value, b_value, err_msg=k)
             if hasattr(a_value, "dtype"):
-                self.assertEqual(a_value.dtype, b_value.dtype)
+                self.assertEqual(a_value.dtype, b_value.dtype, msg=msg)
 
 
 # TODO(markblee): Move this to axlearn/experiments/test_utils.py, where it's used.

@@ -1,5 +1,6 @@
 # Copyright © 2023 Apple Inc.
 """Tests learner."""
+import contextlib
 import copy
 import re
 from numbers import Number
@@ -925,16 +926,18 @@ class HelperTest(TestCase):
 
 
 class CompositeLearnerTest(TestCase):
-    @parameterized.parameters(None, 0.999)
-    def test_forward_and_backward(self, ema_decay):
+    @parameterized.product(
+        ema_decay=[None, 0.999],
+        sublearner_to_loss=[None, dict(encoder="loss", decoder="discriminator_loss")],
+    )
+    def test_forward_and_backward(self, ema_decay, sublearner_to_loss):
         """Demonstrates how API users should use the API while ensuring that it works correctly."""
         # Init a learner.
-        encoder_lr = 0.1
         opt1_cfg = config_for_function(sgd_optimizer).set(
-            learning_rate=encoder_lr, decouple_weight_decay=True, weight_decay=1.0
+            learning_rate=0.1, decouple_weight_decay=True, weight_decay=1.0
         )
-        opt2_cfg = config_for_function(adam_optimizer).set(
-            learning_rate=0.0, b1=0.9, b2=0.99, eps=1e-5, l2_regularizer_weight=1.0
+        opt2_cfg = config_for_function(sgd_optimizer).set(
+            learning_rate=0.2, decouple_weight_decay=True, weight_decay=1.0
         )
         learner_rules = [(".*encoder.*", "encoder"), (".*decoder.*", "decoder")]
 
@@ -949,6 +952,7 @@ class CompositeLearnerTest(TestCase):
                     optimizer=opt2_cfg, enable_per_variable_summaries=False
                 ),
             },
+            sublearner_to_loss=sublearner_to_loss,
         )
         cfg.ema.decay = ema_decay
         learner: CompositeLearner = cfg.instantiate(parent=None)
@@ -1009,20 +1013,81 @@ class CompositeLearnerTest(TestCase):
         learner_state = learner_output_collection.state_updates
         self.assertGreater(forward_outputs.loss, 0.0)
         self.assertGreater(forward_outputs.aux["discriminator_loss"], 0.0)
-        # The structure of updated params and optimizer states are same.
-        opt_state_leaf_fn = lambda x: isinstance(x, (Tensor, optax.MaskedNode))
-        self.assertNestedEqual(
-            jax.tree_util.tree_structure(updated_model_params),
-            jax.tree_util.tree_structure(
-                learner_state["encoder"]["optimizer"][0].trace, is_leaf=opt_state_leaf_fn
-            ),
+        # The sub structure of updated params must be same to the updated optimizer states.
+        # pylint: disable-next=protected-access
+        learner_tree = learner._learner_tree(params=updated_model_params)
+        for sublearner_name in ("encoder", "decoder"):
+            sublearner_apply = jax.tree.map(
+                lambda learner_name, n=sublearner_name: learner_name == n, learner_tree
+            )
+            optimizer_apply = jax.tree.map(
+                lambda updated_params: isinstance(updated_params, Tensor),
+                learner_state[sublearner_name]["optimizer"][0].trace,
+                is_leaf=lambda x: isinstance(x, (Tensor, optax.MaskedNode)),
+            )
+            self.assertNestedEqual(sublearner_apply, optimizer_apply, f"{sublearner_name=}")
+
+    @parameterized.parameters(
+        dict(
+            sublearner_to_loss=None,
+            expected=dict(loss=["decoder", "encoder"]),
+        ),
+        dict(
+            sublearner_to_loss=dict(encoder="loss"),
+            expected=dict(loss=["encoder", "decoder"]),
+        ),
+        dict(
+            sublearner_to_loss=dict(encoder="loss", decoder="loss"),
+            expected=dict(loss=["encoder", "decoder"]),
+        ),
+        dict(
+            sublearner_to_loss=dict(decoder="discriminator_loss"),
+            expected=dict(loss=["encoder"], discriminator_loss=["decoder"]),
+        ),
+        dict(
+            sublearner_to_loss=dict(encoder="loss", decoder="discriminator_loss"),
+            expected=dict(loss=["encoder"], discriminator_loss=["decoder"]),
+        ),
+        dict(
+            sublearner_to_loss=dict(encoder="loss", decoder="discriminator_loss", what="loss"),
+            expected=ValueError("'what' is not found in the known learners."),
+        ),
+        dict(
+            sublearner_to_loss=dict(encoder="discriminator_loss", decoder="discriminator_loss"),
+            expected=ValueError("'loss' must map to at least one sublearner."),
+        ),
+    )
+    def test_create_loss_to_sublearner(self, sublearner_to_loss, expected):
+        opt1_cfg = config_for_function(sgd_optimizer).set(
+            learning_rate=0.1, decouple_weight_decay=True, weight_decay=1.0
         )
-        self.assertNestedEqual(
-            jax.tree_util.tree_structure(updated_model_params),
-            jax.tree_util.tree_structure(
-                learner_state["decoder"]["optimizer"][1].mu, is_leaf=opt_state_leaf_fn
-            ),
+        opt2_cfg = config_for_function(adam_optimizer).set(
+            learning_rate=0.2, b1=0.9, b2=0.99, eps=1e-5, l2_regularizer_weight=1.0
         )
+        learner_rules = [(".*encoder.*", "encoder"), (".*decoder.*", "decoder")]
+
+        cfg = CompositeLearner.default_config().set(
+            name="test",
+            rules=learner_rules,
+            learners={
+                "encoder": Learner.default_config().set(
+                    optimizer=opt1_cfg, enable_per_variable_summaries=True
+                ),
+                "decoder": Learner.default_config().set(
+                    optimizer=opt2_cfg, enable_per_variable_summaries=False
+                ),
+            },
+            sublearner_to_loss=sublearner_to_loss,
+        )
+
+        if isinstance(expected, Exception):
+            ctx = self.assertRaisesRegex(type(expected), str(expected))
+        else:
+            ctx = contextlib.nullcontext()
+
+        with ctx:
+            learner: CompositeLearner = cfg.instantiate(parent=None)
+            self.assertEqual(learner.loss_to_sublearner, expected)
 
     @parameterized.product(ema_decay=(None, 0.9), method=("update", "forward_and_backward"))
     # pylint: disable-next=too-many-statements
